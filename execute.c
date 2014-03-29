@@ -17,6 +17,7 @@
  */
 
 #include "ccache.h"
+#include "strtok_r.h"
 
 static char *
 find_executable_in_path(const char *name, const char *exclude_name, char *path);
@@ -138,6 +139,7 @@ win32execute(char *path, char **argv, int doreturn,
 			return -1;
 	}
 	args = argvtos(sh, argv);
+	cc_log("!!!CreateProcess: %s", args);
 	ret = CreateProcess(path, args, NULL, NULL, 1, 0, NULL, NULL, &si, &pi);
 	free(args);
 	if (path_stdout) {

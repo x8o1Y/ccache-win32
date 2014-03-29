@@ -17,6 +17,7 @@
  */
 
 #include "ccache.h"
+#include "strtok_r.h"
 
 struct args *
 args_init(int init_argc, char **init_args)
@@ -74,6 +75,9 @@ args_free(struct args *args)
 void
 args_add(struct args *args, const char *s)
 {
+	if(NULL == args){
+		return;
+	}
 	args->argv = (char**)x_realloc(args->argv, (args->argc + 2) * sizeof(char *));
 	args->argv[args->argc] = x_strdup(s);
 	args->argc++;
@@ -159,6 +163,17 @@ args_to_string(struct args *args)
 	char **p;
 	unsigned size = 0;
 	int pos;
+	if(NULL == args) {
+		char* res_str = "NULL";
+		result = x_malloc(strlen(res_str)+1);
+		strcpy(result, res_str);
+		return result;
+	}
+	if(0 == args->argc) {
+		result = x_malloc(1);
+		result[0] = '\0';
+		return result;
+	}
 	for (p = args->argv; *p; p++) {
 		size += strlen(*p) + 1;
 	}
@@ -167,7 +182,7 @@ args_to_string(struct args *args)
 	for (p = args->argv; *p; p++) {
 		pos += sprintf(&result[pos], "%s ", *p);
 	}
-	result[pos - 1] = '\0';
+	result[pos] = '\0';
 	return result;
 }
 

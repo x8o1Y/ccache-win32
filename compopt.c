@@ -57,21 +57,27 @@ static const struct compopt compopts[] = {
 	{"-fprofile-use",   TOO_HARD},
 	{"-frepo",          TOO_HARD},
 	{"-ftest-coverage", TOO_HARD},
+	{"-i",              AFFECTS_CPP | TAKES_ARG | TAKES_CONCAT_ARG | TAKES_PATH},
 	{"-idirafter",      AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-imacros",        AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-imultilib",      AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-include",        AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-install_name",   TAKES_ARG}, /* Darwin linker option */
+	{"-ipa",            TAKES_ARG},
 	{"-iprefix",        AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-iquote",         AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
+	{"-ir",             AFFECTS_CPP | TAKES_ARG | TAKES_CONCAT_ARG | TAKES_PATH},
 	{"-isysroot",       AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-isystem",        AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-iwithprefix",    AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
 	{"-iwithprefixbefore", AFFECTS_CPP | TAKES_ARG | TAKES_PATH},
+	{"-msgstyle", 		TAKES_ARG},
 	{"-nostdinc",       AFFECTS_CPP},
 	{"-nostdinc++",     AFFECTS_CPP},
-	{"-save-temps",     TOO_HARD},
+	{"-opt",     		TAKES_ARG},
+	{"-save-temps",     TAKES_ARG},
 	{"-u",              TAKES_ARG},
+	{"-w",              TAKES_ARG},
 };
 
 static int

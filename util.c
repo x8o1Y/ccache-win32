@@ -18,6 +18,7 @@
  */
 
 #include "ccache.h"
+#include "config.h"
 
 #include <zlib.h>
 
@@ -846,10 +847,11 @@ gnu_getcwd(void)
 		}
 		free(buffer);
 		if (errno != ERANGE) {
-			return 0;
+			break;
 		}
 		size *= 2;
 	}
+	return NULL;
 }
 
 /* create an empty file */
@@ -1090,6 +1092,7 @@ read_file(const char *path, size_t size_hint, char **data, size_t *size)
 {
 	int fd, ret;
 	size_t pos = 0, allocated;
+	size_t numNytesToRead;
 
 	if (size_hint == 0) {
 		struct stat st;
@@ -1108,15 +1111,19 @@ read_file(const char *path, size_t size_hint, char **data, size_t *size)
 	ret = 0;
 	while (true) {
 		if (pos > allocated / 2) {
-			allocated *= 2;
+			allocated += allocated / 4;
 			*data = x_realloc(*data, allocated);
 		}
-		ret = read(fd, *data + pos, allocated - pos);
-		if (ret == 0 || (ret == -1 && errno != EINTR)) {
+		numNytesToRead = (size_t)(allocated - pos);
+		ret = read(fd, *data + pos, numNytesToRead);
+		if (ret == 0 || ((ret < 0) && (errno != EINTR))) {
 			break;
 		}
 		if (ret > 0) {
 			pos += ret;
+		}
+		if((size_t)ret < numNytesToRead) {
+            break; // convert CR,LF to CR, so read size is less then file size
 		}
 	}
 	close(fd);

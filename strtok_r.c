@@ -13,6 +13,8 @@
 
 #ifndef HAVE_STRTOK_R
 
+#include "strtok_r.h"
+
 static const char rcsid[] = "$Id: strtok_r.c,v 1.1 2001/04/24 14:25:34 chris Exp $";
 
 /* Reentrant string tokenizer.  Generic version.

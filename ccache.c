@@ -31,6 +31,25 @@
 #include "hashutil.h"
 #include "language.h"
 #include "manifest.h"
+#include "strtok_r.h"
+
+#define CC_DEBUG_LOG	0
+
+#if defined(CC_DEBUG_LOG) && CC_DEBUG_LOG
+void cc_log_args(const char* func, const char* args_name, struct args* args) {
+	char* args_str = args_to_string(args);
+	cc_log("%s: %s: %s", func, args_name, args_str);
+	free(args_str);
+}
+#define CC_LOG_DBG(msg_) \
+	cc_log msg_
+#define CC_LOG_ARGS(args_) \
+	cc_log_args(__func__, #args_, args_)
+#else
+#define CC_LOG_DBG(msg_)
+#define CC_LOG_ARGS(args_)
+#endif
+
 
 static const char VERSION_TEXT[] =
 MYNAME " version %s\n"
@@ -291,7 +310,8 @@ remember_include_file(char *path, size_t path_len, struct mdfour *cpp_hash)
 	int result;
 	bool is_pch;
 
-	if (path_len >= 2 && (path[0] == '<' && path[path_len - 1] == '>')) {
+	if (path_len >= 2 && ((path[0] == '<' && path[path_len - 1] == '>') ||
+                          (path[0] == '(' && path[path_len - 1] == ')')) ) {
 		/* Typically <built-in> or <command-line>. */
 		goto ignore;
 	}
@@ -307,7 +327,7 @@ remember_include_file(char *path, size_t path_len, struct mdfour *cpp_hash)
 	}
 
 	if (stat(path, &st) != 0) {
-		cc_log("Failed to stat include file %s", path);
+		cc_log("Failed to stat include file '%s'", path);
 		goto failure;
 	}
 	if (S_ISDIR(st.st_mode)) {
@@ -349,8 +369,8 @@ remember_include_file(char *path, size_t path_len, struct mdfour *cpp_hash)
 			}
 
 			result = hash_source_code_string(&fhash, source, size, path);
-			if (result & HASH_SOURCE_CODE_ERROR
-			    || result & HASH_SOURCE_CODE_FOUND_TIME) {
+			if ((result & HASH_SOURCE_CODE_ERROR)
+			    || (result & HASH_SOURCE_CODE_FOUND_TIME)) {
 				goto failure;
 			}
 		}
@@ -446,7 +466,7 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 		            && str_startswith(&q[2], "ragma GCC pch_preprocess "))
 		        /* HP: */
 		        || (q[1] == 'l' && q[2] == 'i' && q[3] == 'n' && q[4] == 'e'
-		            && q[5] == ' '))
+		            && q[5] == ' ' && q[6] == '"'))
 		    && (q == data || q[-1] == '\n')) {
 			char *path;
 
@@ -454,23 +474,24 @@ process_preprocessed_file(struct mdfour *hash, const char *path)
 				q++;
 			}
 			q++;
-			if (q >= end) {
-				cc_log("Failed to parse included file path");
-				free(data);
-				return false;
-			}
-			/* q points to the beginning of an include file path */
-			hash_buffer(hash, p, q - p);
-			p = q;
-			while (q < end && *q != '"') {
-				q++;
-			}
-			/* p and q span the include file path */
-			path = x_strndup(p, q - p);
-			path = make_relative_path(path);
-			hash_string(hash, path);
-			remember_include_file(path, q - p, hash);
-			p = q;
+            if (q >= end) {
+                *q = '\0';
+                cc_log("Failed to parse included file path (q >= end), p='%s'", p);
+                free(data);
+                return false;
+            }
+            /* q points to the beginning of an include file path */
+            hash_buffer(hash, p, q - p);
+            p = q;
+            while (q < end && *q != '"') {
+                q++;
+            }
+            /* p and q span the include file path */
+            path = x_strndup(p, q - p);
+            path = make_relative_path(path);
+            hash_string(hash, path);
+            remember_include_file(path, q - p, hash);
+            p = q;
 		} else {
 			q++;
 		}
@@ -861,7 +882,7 @@ calculate_common_hash(struct args *args, struct mdfour *hash)
  * otherwise NULL. Caller frees.
  */
 static struct file_hash *
-calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
+calculate_object_hash(struct args *preprocessor_args, struct args *preprocessor_compile_args, struct mdfour *hash, int direct_mode)
 {
 	int i;
 	char *manifest_name;
@@ -869,14 +890,17 @@ calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
 	int result;
 	struct file_hash *object_hash = NULL;
 
+   	CC_LOG_ARGS(preprocessor_args);
+   	CC_LOG_ARGS(preprocessor_compile_args);
+
 	/* first the arguments */
-	for (i = 1; i < args->argc; i++) {
+	for (i = 1; i < preprocessor_args->argc; i++) {
 		/* -L doesn't affect compilation. */
-		if (i < args->argc-1 && str_eq(args->argv[i], "-L")) {
+		if (i < preprocessor_args->argc-1 && str_eq(preprocessor_args->argv[i], "-L")) {
 			i++;
 			continue;
 		}
-		if (str_startswith(args->argv[i], "-L")) {
+		if (str_startswith(preprocessor_args->argv[i], "-L")) {
 			continue;
 		}
 
@@ -886,21 +910,21 @@ calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
 		   all. For precompiled headers this might not be the case. */
 		if (!direct_mode && !output_is_precompiled_header
 		    && !using_precompiled_header) {
-			if (compopt_affects_cpp(args->argv[i])) {
+			if (compopt_affects_cpp(preprocessor_args->argv[i])) {
 				i++;
 				continue;
 			}
-			if (compopt_short(compopt_affects_cpp, args->argv[i])) {
+			if (compopt_short(compopt_affects_cpp, preprocessor_args->argv[i])) {
 				continue;
 			}
 		}
 
-		if (str_startswith(args->argv[i], "--specs=") &&
-		    stat(args->argv[i] + 8, &st) == 0) {
+		if (str_startswith(preprocessor_args->argv[i], "--specs=") &&
+		    stat(preprocessor_args->argv[i] + 8, &st) == 0) {
 			/* If given a explicit specs file, then hash that file,
 			   but don't include the path to it in the hash. */
 			hash_delimiter(hash, "specs");
-			if (!hash_file(hash, args->argv[i] + 8)) {
+			if (!hash_file(hash, preprocessor_args->argv[i] + 8)) {
 				failed();
 			}
 			continue;
@@ -908,9 +932,10 @@ calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
 
 		/* All other arguments are included in the hash. */
 		hash_delimiter(hash, "arg");
-		hash_string(hash, args->argv[i]);
+		hash_string(hash, preprocessor_args->argv[i]);
 	}
 
+   	CC_LOG_DBG(("calculate_object_hash: direct_mode: %s", direct_mode?"true":"false"));
 	if (direct_mode) {
 		if (!(sloppiness & SLOPPY_FILE_MACRO)) {
 			/*
@@ -923,6 +948,7 @@ calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
 		}
 
 		hash_delimiter(hash, "sourcecode");
+        CC_LOG_DBG(("calculate_object_hash: call hash_source_code_file"));
 		result = hash_source_code_file(hash, input_file);
 		if (result & HASH_SOURCE_CODE_ERROR) {
 			failed();
@@ -943,7 +969,8 @@ calculate_object_hash(struct args *args, struct mdfour *hash, int direct_mode)
 			cc_log("Did not find object file hash in manifest");
 		}
 	} else {
-		object_hash = get_object_name_from_cpp(args, hash);
+        CC_LOG_DBG(("calculate_object_hash: call get_object_name_from_cpp"));
+		object_hash = get_object_name_from_cpp(preprocessor_compile_args, hash);
 		cc_log("Got object file hash from preprocessor");
 		if (generating_dependencies) {
 			cc_log("Preprocessor created %s", output_dep);
@@ -1174,6 +1201,510 @@ is_precompiled_header(const char *path)
 	return str_eq(get_extension(path), ".gch");
 }
 
+static bool cc_process_arg(char* arg, char* next_arg, bool* pUseNextArg,
+		bool* p_found_c_opt,
+		bool* p_found_S_opt,
+		bool* p_found_arch_opt,
+		bool* p_found_pch,
+		bool* p_found_fpch_preprocess,
+		const char** p_explicit_language,
+		const char** p_input_charset,
+		bool* p_dependency_filename_specified,
+		bool* p_dependency_target_specified,
+		struct args *stripped_args,
+		struct args *stripped_args2,
+		struct args *dep_args);
+
+typedef struct ListOfArgs ListOfArgs;
+struct ListOfArgs {
+	struct ListOfArgs* next;
+	char* arg;
+};
+
+typedef struct ListOfArgsHead ListOfArgsHead;
+struct ListOfArgsHead {
+	ListOfArgs* first;
+	ListOfArgs* last;
+};
+
+void ListOfArgs_Init(ListOfArgsHead* pHead) {
+	pHead->first = NULL;
+	pHead->last = NULL;
+}
+
+void ListOfArgs_Deinit(ListOfArgsHead* pHead) {
+	ListOfArgs* pArgElem = pHead->first;
+	ListOfArgs* pNextArgElem;
+	while(NULL != pArgElem) {
+		pNextArgElem = pArgElem->next;
+		free((void*)pArgElem->arg);
+		free(pArgElem);
+		pArgElem = pNextArgElem;
+	}
+}
+
+void ListOfArgs_AppendArg(ListOfArgsHead* pHead, const char* arg){
+	ListOfArgs* pArgElem;
+	CC_LOG_DBG(("ListOfArgs_AppendArg: %s", arg));
+	pArgElem = x_malloc(sizeof(*pArgElem));
+	pArgElem->next = NULL;
+	pArgElem->arg = x_strdup(arg);
+	if(pHead->first == NULL) {
+		pHead->first = pHead->last = pArgElem;
+	}else{
+		pHead->last->next = pArgElem;
+		pHead->last = pArgElem;
+	}
+
+}
+
+
+static bool cc_process_arg_from_file(const char* file_name,
+		bool* p_found_c_opt,
+		bool* p_found_S_opt,
+		bool* p_found_arch_opt,
+		bool* p_found_pch,
+		bool* p_found_fpch_preprocess,
+		const char** p_explicit_language,
+		const char** p_input_charset,
+		bool* p_dependency_filename_specified,
+		bool* p_dependency_target_specified,
+		struct args *stripped_args,
+		struct args *dep_args) {
+	ListOfArgsHead headOfListOfArgs = {NULL, NULL};
+	char buf[1024];
+	bool res = true;
+	FILE* fd = fopen(file_name, "r");
+	if(NULL == fd) {
+	    CC_LOG_DBG(("cc_process_arg_from_file: can't open file: %s", file_name));
+		return false;
+	}
+
+	while(NULL != fgets(buf, sizeof(buf), fd)) {
+		char* arg = &buf[0];
+		char* p;
+		size_t len = strlen(arg);
+		if(len > 0) {
+			if('\n'==arg[len-1]){
+				len -= 1;
+				arg[len] = '\0';
+			}
+		}
+		do{
+			if(arg[0] == '"') {
+				p = strchr(arg+1, '"');
+				if(NULL != p) {
+					p++;
+					*p++ = '\0';
+					ListOfArgs_AppendArg(&headOfListOfArgs, arg);
+				}else{
+					ListOfArgs_AppendArg(&headOfListOfArgs, arg);
+				}
+			}else{
+				p = strchr(arg, ' ');
+				if(NULL != p){
+					*p++ = '\0';
+				}
+				ListOfArgs_AppendArg(&headOfListOfArgs, arg);
+			}
+			if(NULL != p){
+				while((*p==' ') || (*p=='\t')) {
+					p++;
+				}
+				if(*p == '\0'){
+					p = NULL;
+				}
+			}
+			arg = p;
+		}while(NULL != arg);
+	}
+
+	{
+		ListOfArgs* pArgElem = headOfListOfArgs.first;
+		char* nextArg;
+		bool UseNextArg;
+		while( NULL != pArgElem ) {
+			if( NULL != pArgElem->next ) {
+				nextArg = pArgElem->next->arg;
+			}else{
+				nextArg = NULL;
+			}
+	    	CC_LOG_ARGS(stripped_args);
+	    	CC_LOG_ARGS(dep_args);
+			res = cc_process_arg(pArgElem->arg, nextArg, &UseNextArg,
+					p_found_c_opt,
+					p_found_S_opt,
+					p_found_arch_opt,
+					p_found_pch,
+					p_found_fpch_preprocess,
+					p_explicit_language,
+					p_input_charset,
+					p_dependency_filename_specified,
+					p_dependency_target_specified,
+					stripped_args,
+					NULL,
+					dep_args);
+	    	CC_LOG_ARGS(stripped_args);
+	    	CC_LOG_ARGS(dep_args);
+			if( !res ) {
+				goto l_exit;
+			}
+			pArgElem = pArgElem->next;
+			if(UseNextArg && (NULL!=pArgElem)) {
+                pArgElem = pArgElem->next;
+			}
+		}
+	}
+
+l_exit:
+	ListOfArgs_Deinit(&headOfListOfArgs);
+	fclose(fd);
+	return res;
+}
+
+static bool cc_process_arg(char* arg, char* next_arg, bool* pUseNextArg,
+		bool* p_found_c_opt,
+		bool* p_found_S_opt,
+		bool* p_found_arch_opt,
+		bool* p_found_pch,
+		bool* p_found_fpch_preprocess,
+		const char** p_explicit_language,
+		const char** p_input_charset,
+		bool* p_dependency_filename_specified,
+		bool* p_dependency_target_specified,
+		struct args *stripped_args,
+		struct args *stripped_args2,
+		struct args *dep_args) {
+	struct stat st;
+    CC_LOG_DBG(("cc_process_arg: handle arg: %s", arg));
+   	CC_LOG_ARGS(stripped_args);
+   	CC_LOG_ARGS(stripped_args2);
+   	CC_LOG_ARGS(dep_args);
+    *pUseNextArg = false;
+	/* The user knows best: just swallow the next arg */
+	if (str_eq(arg, "--ccache-skip")) {
+		*pUseNextArg = true;
+		if (NULL == next_arg) {
+			CC_LOG_DBG(("--ccache-skip lacks an argument"));
+			return false;
+		}
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		return true;
+	}
+
+	/* some options will never work ... */
+	if (str_eq(arg, "-E")) {
+		cc_log("Compiler option -E is unsupported");
+		stats_update(STATS_UNSUPPORTED);
+		return false;
+	}
+
+	/* these are too hard */
+	if (compopt_too_hard(arg)) {
+		cc_log("Compiler option %s is unsupported", arg);
+		stats_update(STATS_UNSUPPORTED);
+		return false;
+	}
+	if (str_startswith(arg, "@")) {
+        const char* p = arg;
+        p++;
+        if(*p=='@') {
+            p++;
+        }
+		args_add(stripped_args2, arg);
+        if( !cc_process_arg_from_file(p,
+				p_found_c_opt,
+				p_found_S_opt,
+				p_found_arch_opt,
+				p_found_pch,
+				p_found_fpch_preprocess,
+				p_explicit_language,
+				p_input_charset,
+				p_dependency_filename_specified,
+				p_dependency_target_specified,
+				stripped_args,
+				dep_args) ) {
+    		stats_update(STATS_UNSUPPORTED);
+    		return false;
+        }
+        return true;
+	}
+
+	/* These are too hard in direct mode. */
+	if (enable_direct) {
+		if (compopt_too_hard_for_direct_mode(arg)) {
+			cc_log("Unsupported compiler option for direct mode: %s", arg);
+			enable_direct = false;
+		}
+	}
+
+	/* Multiple -arch options are too hard. */
+	if (str_eq(arg, "-arch")) {
+		if (*p_found_arch_opt) {
+			cc_log("More than one -arch compiler option is unsupported");
+			stats_update(STATS_UNSUPPORTED);
+			return false;
+		} else {
+			*p_found_arch_opt = true;
+		}
+	}
+
+	if (str_eq(arg, "-fpch-preprocess")) {
+		*p_found_fpch_preprocess = true;
+	}
+
+	/* we must have -c */
+	if (str_eq(arg, "-c")) {
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		*p_found_c_opt = true;
+		return true;
+	}
+
+	/* -S changes the default extension */
+	if (str_eq(arg, "-S")) {
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		*p_found_S_opt = true;
+		return true;
+	}
+
+	/*
+	 * Special handling for -x: remember the last specified language before the
+	 * input file and strip all -x options from the arguments.
+	 */
+	if (str_eq(arg, "-x")) {
+		if (NULL == next_arg) {
+			cc_log("Missing argument to %s", arg);
+			stats_update(STATS_ARGS);
+			return false;
+		}
+		*pUseNextArg = true;
+		if (!input_file) {
+			*p_explicit_language = next_arg;
+		}
+		return true;
+	}
+	if (str_startswith(arg, "-x")) {
+		if (!input_file) {
+			*p_explicit_language = &arg[2];
+		}
+		return true;
+	}
+
+	/* we need to work out where the output was meant to go */
+	if (str_eq(arg, "-o")) {
+		if (NULL == next_arg) {
+			cc_log("Missing argument to %s", arg);
+			stats_update(STATS_ARGS);
+			return false;
+		}
+		*pUseNextArg = true;
+		output_obj = next_arg;
+		return true;
+	}
+
+#if 0
+	/* alternate form of -o, with no space */
+	if (str_startswith(arg, "-o")) {
+		output_obj = &arg[2];
+		return true;
+	}
+#endif
+
+	/* debugging is handled specially, so that we know if we
+	   can strip line number info
+	*/
+	if (str_startswith(arg, "-g")) {
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		if (enable_unify && !str_eq(arg, "-g0")) {
+			cc_log("%s used; disabling unify mode", arg);
+			enable_unify = false;
+		}
+		if (str_eq(arg, "-g3")) {
+			/*
+			 * Fix for bug 7190 ("commandline macros (-D)
+			 * have non-zero lineno when using -g3").
+			 */
+			cc_log("%s used; not compiling pre-processed code", arg);
+			compile_preprocessed_source_code = false;
+		}
+		return true;
+	}
+
+	/* These options require special handling, because they
+	   behave differently with gcc -E, when the output
+	   file is not specified. */
+	if (str_eq(arg, "-MD") || str_eq(arg, "-MMD")) {
+		generating_dependencies = true;
+#if 0
+		args_add(dep_args, arg);
+#endif
+		return true;
+	}
+#if 0
+	if (NULL == next_arg) {
+		if (str_eq(arg, "-MF")) {
+			*p_dependency_filename_specified = true;
+			free(output_dep);
+			*pUseNextArg = true;
+			output_dep = make_relative_path(x_strdup(next_arg));
+			args_add(dep_args, arg);
+			args_add(dep_args, next_arg);
+			return true;
+		} else if (str_eq(arg, "-MQ") || str_eq(arg, "-MT")) {
+			*p_dependency_target_specified = true;
+			*pUseNextArg = true;
+			args_add(dep_args, arg);
+			args_add(dep_args, next_arg);
+			return true;
+		}
+	}
+#endif
+	if (str_startswith(arg, "-Wp,")) {
+		if (str_startswith(arg, "-Wp,-MD,") && !strchr(arg + 8, ',')) {
+			generating_dependencies = true;
+			*p_dependency_filename_specified = true;
+			free(output_dep);
+			output_dep = make_relative_path(x_strdup(arg + 8));
+			args_add(dep_args, arg);
+			return true;
+		} else if (str_startswith(arg, "-Wp,-MMD,")
+		           && !strchr(arg + 9, ',')) {
+			generating_dependencies = true;
+			*p_dependency_filename_specified = true;
+			free(output_dep);
+			output_dep = make_relative_path(x_strdup(arg + 9));
+			args_add(dep_args, arg);
+			return true;
+		} else if (enable_direct) {
+			/*
+			 * -Wp, can be used to pass too hard options to
+			 * the preprocessor. Hence, disable direct
+			 * mode.
+			 */
+			cc_log("Unsupported compiler option for direct mode: %s", arg);
+			enable_direct = false;
+		}
+	}
+	if (str_eq(arg, "-MP")) {
+		args_add(dep_args, arg);
+		return true;
+	}
+
+	/* Input charset needs to be handled specially. */
+	if (str_startswith(arg, "-finput-charset=")) {
+		*p_input_charset = arg;
+		return true;
+	}
+
+	/*
+	 * Options taking an argument that that we may want to rewrite
+	 * to relative paths to get better hit rate. A secondary effect
+	 * is that paths in the standard error output produced by the
+	 * compiler will be normalized.
+	 */
+	if (compopt_takes_path(arg)) {
+		char *relpath;
+		char *pchpath;
+		if (NULL == next_arg) {
+			cc_log("Missing argument to %s", arg);
+			stats_update(STATS_ARGS);
+			return false;
+		}
+
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		relpath = make_relative_path(x_strdup(next_arg));
+		args_add(stripped_args, relpath);
+		args_add(stripped_args2, relpath);
+
+		/* Try to be smart about detecting precompiled headers */
+		pchpath = format("%s.gch", next_arg);
+		if (stat(pchpath, &st) == 0) {
+			cc_log("Detected use of precompiled header: %s", pchpath);
+			*p_found_pch = true;
+		}
+
+		free(pchpath);
+		free(relpath);
+		*pUseNextArg = true;
+		return true;
+	}
+
+#if 0
+	/* Same as above but options with concatenated argument. */
+	if (compopt_short(compopt_takes_path, arg)) {
+		char *relpath;
+		char *option;
+		relpath = make_relative_path(x_strdup(arg + 2));
+		option = format("-%c%s", arg[1], relpath);
+		args_add(stripped_args, option);
+		args_add(stripped_args2, option);
+		free(relpath);
+		free(option);
+		return true;
+	}
+#endif
+
+	/* options that take an argument */
+	if (compopt_takes_arg(arg)) {
+		if (NULL == next_arg) {
+			cc_log("Missing argument to %s", arg);
+			stats_update(STATS_ARGS);
+			return false;
+		}
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		args_add(stripped_args, next_arg);
+		args_add(stripped_args2, next_arg);
+		*pUseNextArg = true;
+		return true;
+	}
+
+	/* other options */
+	if (arg[0] == '-') {
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		return true;
+	}
+
+	/* if an argument isn't a plain file then assume its
+	   an option, not an input file. This allows us to
+	   cope better with unusual compiler options */
+	if (stat(arg, &st) != 0 || !S_ISREG(st.st_mode)) {
+		cc_log("%s is not a regular file, not considering as input file",
+		       arg);
+		args_add(stripped_args, arg);
+		args_add(stripped_args2, arg);
+		return true;
+	}
+
+	if (input_file) {
+		if (language_for_file(arg)) {
+			cc_log("Multiple input files: %s and %s", input_file, arg);
+			stats_update(STATS_MULTIPLE);
+		} else if (!*p_found_c_opt) {
+			cc_log("Called for link with %s", arg);
+			if (strstr(arg, "conftest.")) {
+				stats_update(STATS_CONFTEST);
+			} else {
+				stats_update(STATS_LINK);
+			}
+		} else {
+			cc_log("Unsupported source extension: %s", arg);
+			stats_update(STATS_SOURCELANG);
+		}
+		return false;
+	}
+
+	/* Rewrite to relative to increase hit rate. */
+	input_file = make_relative_path(x_strdup(arg));
+	return true;
+}
+
 /*
  * Process the compiler options into options suitable for passing to the
  * preprocessor and the real compiler. The preprocessor options don't include
@@ -1181,6 +1712,7 @@ is_precompiled_header(const char *path)
  */
 bool
 cc_process_args(struct args *orig_args, struct args **preprocessor_args,
+				struct args **preprocessor_compiler_args,
                 struct args **compiler_args)
 {
 	int i;
@@ -1198,304 +1730,54 @@ cc_process_args(struct args *orig_args, struct args **preprocessor_args,
 	bool dependency_filename_specified = false;
 	/* is the dependency makefile target name specified with -MT or -MQ? */
 	bool dependency_target_specified = false;
-	struct args *stripped_args = NULL, *dep_args = NULL;
+	struct args *stripped_args = NULL;
+	struct args *stripped_args2 = NULL;
+	struct args *dep_args = NULL;
 	int argc = orig_args->argc;
 	char **argv = orig_args->argv;
 	bool result = true;
 
 	stripped_args = args_init(0, NULL);
+	stripped_args2 = args_init(0, NULL);
 	dep_args = args_init(0, NULL);
 
 	args_add(stripped_args, argv[0]);
+	args_add(stripped_args2, argv[0]);
 
 	for (i = 1; i < argc; i++) {
-		/* The user knows best: just swallow the next arg */
-		if (str_eq(argv[i], "--ccache-skip")) {
-			i++;
-			if (i == argc) {
-				cc_log("--ccache-skip lacks an argument");
-				result = false;
-				goto out;
-			}
-			args_add(stripped_args, argv[i]);
-			continue;
+		bool UseNextArg;
+		char* next_arg;
+		if( i == argc-1 ) {
+			next_arg = NULL;
+		}else{
+			next_arg = argv[i+1];
 		}
-
-		/* some options will never work ... */
-		if (str_eq(argv[i], "-E")) {
-			cc_log("Compiler option -E is unsupported");
-			stats_update(STATS_UNSUPPORTED);
-			result = false;
+    	CC_LOG_DBG(("cc_process_args: argv[%d]: %s", i, argv[i]));
+    	CC_LOG_ARGS(stripped_args);
+    	CC_LOG_ARGS(stripped_args2);
+    	CC_LOG_ARGS(dep_args);
+		if (!cc_process_arg(argv[i], next_arg, &UseNextArg,
+				&found_c_opt,
+				&found_S_opt,
+				&found_arch_opt,
+				&found_pch,
+				&found_fpch_preprocess,
+				&explicit_language,
+				&input_charset,
+				&dependency_filename_specified,
+				&dependency_target_specified,
+				stripped_args,
+				stripped_args2,
+				dep_args) ) {
+            result = false;
 			goto out;
 		}
-
-		/* these are too hard */
-		if (compopt_too_hard(argv[i]) || str_startswith(argv[i], "@")) {
-			cc_log("Compiler option %s is unsupported", argv[i]);
-			stats_update(STATS_UNSUPPORTED);
-			result = false;
-			goto out;
-		}
-
-		/* These are too hard in direct mode. */
-		if (enable_direct) {
-			if (compopt_too_hard_for_direct_mode(argv[i])) {
-				cc_log("Unsupported compiler option for direct mode: %s", argv[i]);
-				enable_direct = false;
-			}
-		}
-
-		/* Multiple -arch options are too hard. */
-		if (str_eq(argv[i], "-arch")) {
-			if (found_arch_opt) {
-				cc_log("More than one -arch compiler option is unsupported");
-				stats_update(STATS_UNSUPPORTED);
-				result = false;
-				goto out;
-			} else {
-				found_arch_opt = true;
-			}
-		}
-
-		if (str_eq(argv[i], "-fpch-preprocess")) {
-			found_fpch_preprocess = true;
-		}
-
-		/* we must have -c */
-		if (str_eq(argv[i], "-c")) {
-			args_add(stripped_args, argv[i]);
-			found_c_opt = true;
-			continue;
-		}
-
-		/* -S changes the default extension */
-		if (str_eq(argv[i], "-S")) {
-			args_add(stripped_args, argv[i]);
-			found_S_opt = true;
-			continue;
-		}
-
-		/*
-		 * Special handling for -x: remember the last specified language before the
-		 * input file and strip all -x options from the arguments.
-		 */
-		if (str_eq(argv[i], "-x")) {
-			if (i == argc-1) {
-				cc_log("Missing argument to %s", argv[i]);
-				stats_update(STATS_ARGS);
-				result = false;
-				goto out;
-			}
-			if (!input_file) {
-				explicit_language = argv[i+1];
-			}
+    	CC_LOG_ARGS(stripped_args);
+    	CC_LOG_ARGS(stripped_args2);
+    	CC_LOG_ARGS(dep_args);
+		if(UseNextArg) {
 			i++;
-			continue;
 		}
-		if (str_startswith(argv[i], "-x")) {
-			if (!input_file) {
-				explicit_language = &argv[i][2];
-			}
-			continue;
-		}
-
-		/* we need to work out where the output was meant to go */
-		if (str_eq(argv[i], "-o")) {
-			if (i == argc-1) {
-				cc_log("Missing argument to %s", argv[i]);
-				stats_update(STATS_ARGS);
-				result = false;
-				goto out;
-			}
-			output_obj = argv[i+1];
-			i++;
-			continue;
-		}
-
-		/* alternate form of -o, with no space */
-		if (str_startswith(argv[i], "-o")) {
-			output_obj = &argv[i][2];
-			continue;
-		}
-
-		/* debugging is handled specially, so that we know if we
-		   can strip line number info
-		*/
-		if (str_startswith(argv[i], "-g")) {
-			args_add(stripped_args, argv[i]);
-			if (enable_unify && !str_eq(argv[i], "-g0")) {
-				cc_log("%s used; disabling unify mode", argv[i]);
-				enable_unify = false;
-			}
-			if (str_eq(argv[i], "-g3")) {
-				/*
-				 * Fix for bug 7190 ("commandline macros (-D)
-				 * have non-zero lineno when using -g3").
-				 */
-				cc_log("%s used; not compiling preprocessed code", argv[i]);
-				compile_preprocessed_source_code = false;
-			}
-			continue;
-		}
-
-		/* These options require special handling, because they
-		   behave differently with gcc -E, when the output
-		   file is not specified. */
-		if (str_eq(argv[i], "-MD") || str_eq(argv[i], "-MMD")) {
-			generating_dependencies = true;
-			args_add(dep_args, argv[i]);
-			continue;
-		}
-		if (i < argc - 1) {
-			if (str_eq(argv[i], "-MF")) {
-				dependency_filename_specified = true;
-				free(output_dep);
-				output_dep = make_relative_path(x_strdup(argv[i + 1]));
-				args_add(dep_args, argv[i]);
-				args_add(dep_args, argv[i + 1]);
-				i++;
-				continue;
-			} else if (str_eq(argv[i], "-MQ") || str_eq(argv[i], "-MT")) {
-				dependency_target_specified = true;
-				args_add(dep_args, argv[i]);
-				args_add(dep_args, argv[i + 1]);
-				i++;
-				continue;
-			}
-		}
-		if (str_startswith(argv[i], "-Wp,")) {
-			if (str_startswith(argv[i], "-Wp,-MD,") && !strchr(argv[i] + 8, ',')) {
-				generating_dependencies = true;
-				dependency_filename_specified = true;
-				free(output_dep);
-				output_dep = make_relative_path(x_strdup(argv[i] + 8));
-				args_add(dep_args, argv[i]);
-				continue;
-			} else if (str_startswith(argv[i], "-Wp,-MMD,")
-			           && !strchr(argv[i] + 9, ',')) {
-				generating_dependencies = true;
-				dependency_filename_specified = true;
-				free(output_dep);
-				output_dep = make_relative_path(x_strdup(argv[i] + 9));
-				args_add(dep_args, argv[i]);
-				continue;
-			} else if (enable_direct) {
-				/*
-				 * -Wp, can be used to pass too hard options to
-				 * the preprocessor. Hence, disable direct
-				 * mode.
-				 */
-				cc_log("Unsupported compiler option for direct mode: %s", argv[i]);
-				enable_direct = false;
-			}
-		}
-		if (str_eq(argv[i], "-MP")) {
-			args_add(dep_args, argv[i]);
-			continue;
-		}
-
-		/* Input charset needs to be handled specially. */
-		if (str_startswith(argv[i], "-finput-charset=")) {
-			input_charset = argv[i];
-			continue;
-		}
-
-		/*
-		 * Options taking an argument that that we may want to rewrite
-		 * to relative paths to get better hit rate. A secondary effect
-		 * is that paths in the standard error output produced by the
-		 * compiler will be normalized.
-		 */
-		if (compopt_takes_path(argv[i])) {
-			char *relpath;
-			char *pchpath;
-			if (i == argc-1) {
-				cc_log("Missing argument to %s", argv[i]);
-				stats_update(STATS_ARGS);
-				result = false;
-				goto out;
-			}
-
-			args_add(stripped_args, argv[i]);
-			relpath = make_relative_path(x_strdup(argv[i+1]));
-			args_add(stripped_args, relpath);
-
-			/* Try to be smart about detecting precompiled headers */
-			pchpath = format("%s.gch", argv[i+1]);
-			if (stat(pchpath, &st) == 0) {
-				cc_log("Detected use of precompiled header: %s", pchpath);
-				found_pch = true;
-			}
-
-			free(pchpath);
-			free(relpath);
-			i++;
-			continue;
-		}
-
-		/* Same as above but options with concatenated argument. */
-		if (compopt_short(compopt_takes_path, argv[i])) {
-			char *relpath;
-			char *option;
-			relpath = make_relative_path(x_strdup(argv[i] + 2));
-			option = format("-%c%s", argv[i][1], relpath);
-			args_add(stripped_args, option);
-			free(relpath);
-			free(option);
-			continue;
-		}
-
-		/* options that take an argument */
-		if (compopt_takes_arg(argv[i])) {
-			if (i == argc-1) {
-				cc_log("Missing argument to %s", argv[i]);
-				stats_update(STATS_ARGS);
-				result = false;
-				goto out;
-			}
-			args_add(stripped_args, argv[i]);
-			args_add(stripped_args, argv[i+1]);
-			i++;
-			continue;
-		}
-
-		/* other options */
-		if (argv[i][0] == '-') {
-			args_add(stripped_args, argv[i]);
-			continue;
-		}
-
-		/* if an argument isn't a plain file then assume its
-		   an option, not an input file. This allows us to
-		   cope better with unusual compiler options */
-		if (stat(argv[i], &st) != 0 || !S_ISREG(st.st_mode)) {
-			cc_log("%s is not a regular file, not considering as input file",
-			       argv[i]);
-			args_add(stripped_args, argv[i]);
-			continue;
-		}
-
-		if (input_file) {
-			if (language_for_file(argv[i])) {
-				cc_log("Multiple input files: %s and %s", input_file, argv[i]);
-				stats_update(STATS_MULTIPLE);
-			} else if (!found_c_opt) {
-				cc_log("Called for link with %s", argv[i]);
-				if (strstr(argv[i], "conftest.")) {
-					stats_update(STATS_CONFTEST);
-				} else {
-					stats_update(STATS_LINK);
-				}
-			} else {
-				cc_log("Unsupported source extension: %s", argv[i]);
-				stats_update(STATS_SOURCELANG);
-			}
-			result = false;
-			goto out;
-		}
-
-		/* Rewrite to relative to increase hit rate. */
-		input_file = make_relative_path(x_strdup(argv[i]));
 	}
 
 	if (!input_file) {
@@ -1617,21 +1899,30 @@ cc_process_args(struct args *orig_args, struct args **preprocessor_args,
 	 * -x XXX (otherwise the wrong language is selected)
 	 */
 	*preprocessor_args = args_copy(stripped_args);
+	*preprocessor_compiler_args = args_copy(stripped_args2);
 	if (input_charset) {
 		args_add(*preprocessor_args, input_charset);
+		args_add(*preprocessor_compiler_args, input_charset);
 	}
 	if (found_pch) {
 		args_add(*preprocessor_args, "-fpch-preprocess");
+		args_add(*preprocessor_compiler_args, "-fpch-preprocess");
 	}
 	if (explicit_language) {
 		args_add(*preprocessor_args, "-x");
+		args_add(*preprocessor_compiler_args, "-x");
 		args_add(*preprocessor_args, explicit_language);
+		args_add(*preprocessor_compiler_args, explicit_language);
 	}
+   	CC_LOG_ARGS(*preprocessor_args);
+   	CC_LOG_ARGS(*preprocessor_compiler_args);
+   	CC_LOG_ARGS(stripped_args);
 
 	/*
 	 * Add flags for dependency generation only to the preprocessor command line.
 	 */
 	if (generating_dependencies) {
+#if 0
 		if (!dependency_filename_specified) {
 			char *default_depfile_name;
 			char *base_name;
@@ -1648,10 +1939,24 @@ cc_process_args(struct args *orig_args, struct args **preprocessor_args,
 			args_add(dep_args, "-MT");
 			args_add(dep_args, output_obj);
 		}
+#else
+		if (!dependency_filename_specified) {
+			char *default_depfile_name;
+			char *base_name;
+
+			base_name = remove_extension(output_obj);
+			default_depfile_name = format("%s.d", base_name);
+			free(base_name);
+			args_add(dep_args, "-MDfile");
+			args_add(dep_args, default_depfile_name);
+			output_dep = make_relative_path(x_strdup(default_depfile_name));
+		}
+#endif
 	}
 
+	CC_LOG_DBG(("cc_process_args: compile_preprocessed_source_code: %s", compile_preprocessed_source_code?"true":"false"));
 	if (compile_preprocessed_source_code) {
-		*compiler_args = args_copy(stripped_args);
+		*compiler_args = args_copy(stripped_args2);
 		if (explicit_language) {
 			/*
 			 * Workaround for a bug in Apple's patched distcc -- it doesn't properly
@@ -1662,8 +1967,10 @@ cc_process_args(struct args *orig_args, struct args **preprocessor_args,
 			args_add(*compiler_args, p_language_for_language(explicit_language));
 		}
 	} else {
-		*compiler_args = args_copy(*preprocessor_args);
+		*compiler_args = args_copy(*preprocessor_compiler_args);
 	}
+	CC_LOG_ARGS(*compiler_args);
+	CC_LOG_ARGS(dep_args);
 
 	/*
 	 * Only pass dependency arguments to the preprocesor since Intel's C++
@@ -1671,9 +1978,13 @@ cc_process_args(struct args *orig_args, struct args **preprocessor_args,
 	 * source.
 	 */
 	args_extend(*preprocessor_args, dep_args);
+	args_extend(*preprocessor_compiler_args, dep_args);
+	CC_LOG_ARGS(*preprocessor_args);
+	CC_LOG_ARGS(*preprocessor_compiler_args);
 
 out:
 	args_free(stripped_args);
+	args_free(stripped_args2);
 	args_free(dep_args);
 	return result;
 }
@@ -1759,6 +2070,8 @@ ccache(int argc, char *argv[])
 	/* Arguments (except -E) to send to the preprocessor. */
 	struct args *preprocessor_args;
 
+	struct args *preprocessor_compiler_args;
+
 	/* Arguments to send to the real compiler. */
 	struct args *compiler_args;
 
@@ -1799,7 +2112,7 @@ ccache(int argc, char *argv[])
 		if (nlevels > 8) nlevels = 8;
 	}
 
-	if (!cc_process_args(orig_args, &preprocessor_args, &compiler_args)) {
+	if (!cc_process_args(orig_args, &preprocessor_args, &preprocessor_compiler_args, &compiler_args)) {
 		failed();
 	}
 
@@ -1816,7 +2129,7 @@ ccache(int argc, char *argv[])
 	direct_hash = common_hash;
 	if (enable_direct) {
 		cc_log("Trying direct lookup");
-		object_hash = calculate_object_hash(preprocessor_args, &direct_hash, 1);
+		object_hash = calculate_object_hash(preprocessor_args, preprocessor_compiler_args, &direct_hash, 1);
 		if (object_hash) {
 			update_cached_result_globals(object_hash);
 
@@ -1846,7 +2159,7 @@ ccache(int argc, char *argv[])
 	 */
 	cpp_hash = common_hash;
 	cc_log("Running preprocessor");
-	object_hash = calculate_object_hash(preprocessor_args, &cpp_hash, 0);
+	object_hash = calculate_object_hash(preprocessor_args, preprocessor_compiler_args, &cpp_hash, 0);
 	if (!object_hash) {
 		fatal("internal error: object hash from cpp returned NULL");
 	}
